@@ -3,12 +3,18 @@ import "./App.css";
 import React from "react";
 import Plyr from "plyr";
 import {url} from "./wsUrl"
+
+const PC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+let ignoreOffer = false;
+let makingOffer = false;
+let polite = false;
+let srdAnswerPending = false;
+
 class Main extends React.Component {
   constructor(props) {
     super(props);
-    this.state = {
-      ws: null,
-    };
+    this.state = { ws: null };
   }
 
   componentDidMount() {
@@ -18,17 +24,14 @@ class Main extends React.Component {
   timeout = 250;
 
   connect = () => {
-    var ws = new WebSocket(url);
-    let that = this;
-    var connectInterval;
+    const ws = new WebSocket(url);
+    const that = this;
+    let connectInterval;
 
     ws.onopen = () => {
       console.log("Connected to websocket");
-
       this.setState({ ws: ws });
-
       that.timeout = 250;
-
       clearTimeout(connectInterval);
     };
 
@@ -47,12 +50,7 @@ class Main extends React.Component {
 
     // websocket onerror event listener
     ws.onerror = (err) => {
-      console.error(
-        "Socket encountered error: ",
-        err.message,
-        "Closing socket"
-      );
-
+      console.error("Socket encountered error: ", err.message, "Closing socket");
       ws.close();
     };
   };
@@ -68,16 +66,20 @@ class Main extends React.Component {
 }
 
 function App(props) {
-  let pc = new RTCPeerConnection();
-  let log = (msg) => {
+  const pc = new RTCPeerConnection(PC_CONFIG);
+  const log = (msg) => {
     document.getElementById("div").innerHTML += msg + "<br>";
   };
 
-  pc.ontrack = function (event) {
+  pc.onconnectionstatechange = () => console.log(`peer connection ${pc.connectionState}`);
+  pc.oniceconnectionstatechange = () => console.log(`ice connection state: ${pc.iceConnectionState}`);
+  pc.onsignalingstatechange = () => console.log(`signaling state: ${pc.signalingState}`);
+
+  pc.ontrack = (event) => {
     if (event.track.kind === "audio") {
       return;
     }
-    var el = document.getElementById("player");
+    const el = document.getElementById("player");
     el.srcObject = event.streams[0];
     el.autoplay = true;
     el.controls = true;
@@ -96,49 +98,68 @@ function App(props) {
   // pc.addTransceiver('video', { 'direction': 'recvonly' })
   pc.addTransceiver("video", { direction: "recvonly" });
 
-  let ws = props.websocket;
+  const ws = props.websocket;
   pc.onicecandidate = (e) => {
-    if (!e.candidate) {
-      console.log("Candidate fail");
+    if (!e || !e.candidate) {
+      console.log("Candidate null");
+      console.log(e);
       return;
     }
 
-    ws.send(
-      JSON.stringify({ event: "candidate", data: JSON.stringify(e.candidate) })
-    );
+    ws.send(JSON.stringify({ event: "candidate", data: JSON.stringify(e.candidate) }));
+  };
+
+  pc.onnegotiationneeded = async () => {
+    try {
+      makingOffer = true;
+      await pc.setLocalDescription();
+      const msg = { event: "offer", data: JSON.stringify(pc.localDescription) };
+      ws.send(JSON.stringify(msg));
+    }
+    catch (e) {
+      console.error(e);
+    }
+    finally {
+      console.log('local description set');
+      makingOffer = false;
+    }
   };
 
   if (ws) {
-    ws.onmessage = function (evt) {
+    ws.onmessage = async function (evt) {
       let msg = JSON.parse(evt.data);
       if (!msg) {
         return console.log("failed to parse msg");
       }
-
-      switch (msg.event) {
-        case "offer":
-          console.log("offer");
-          let offer = JSON.parse(msg.data);
-          if (!offer) {
-            return console.log("failed to parse answer");
-          }
-          pc.setRemoteDescription(offer);
-          pc.createAnswer().then((answer) => {
-            pc.setLocalDescription(answer);
-            ws.send(
-              JSON.stringify({ event: "answer", data: JSON.stringify(answer) })
-            );
-          });
-          return;
-
-        case "candidate":
-          console.log("candidate");
-          let candidate = JSON.parse(msg.data);
-          if (!candidate) {
-            return console.log("failed to parse candidate");
-          }
-
-          pc.addIceCandidate(candidate);
+      if (msg.event !== "candidate") {
+        console.log(msg.event + " received");
+        console.log(msg.data);
+        const isStable = pc.signalingState === "stable" ||
+                         pc.signalingState === "have-local-offer" && srdAnswerPending;
+        const offerCollision = makingOffer || !isStable;
+        ignoreOffer = !polite && offerCollision;
+        if (ignoreOffer) return;
+        srdAnswerPending = msg.event === "answer";
+        await pc.setRemoteDescription(msg.data);
+        srdAnswerPending = false;
+        console.log("remote description set");
+        if (msg.event === "offer") {
+          await pc.setLocalDescription();
+          console.log("local description set");
+          const msg = { event: "answer", data: JSON.stringify(pc.localDescription) };
+          ws.send(JSON.stringify(msg));
+        }
+      } else {
+        const candidate = JSON.parse(msg.data);
+        console.log(candidate);
+        if (!candidate) {
+          return console.log("failed to parse candidate");
+        }
+        try {
+          await pc.addIceCandidate(candidate);
+        } catch (e) {
+          if (!ignoreOffer) throw e;
+        }
       }
     };
   }
