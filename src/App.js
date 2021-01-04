@@ -14,11 +14,17 @@ let srdAnswerPending = false;
 class Main extends React.Component {
   constructor(props) {
     super(props);
-    this.state = { ws: null };
+    this.pc = null;
+    this.handlePcChange = this.handlePcChange.bind(this);
+    this.state = { ws: null, pc: null };
   }
 
   componentDidMount() {
     this.connect();
+  }
+
+  handlePcChange() {
+    this.setState({ pc: this.pc });
   }
 
   timeout = 250;
@@ -29,10 +35,78 @@ class Main extends React.Component {
     let connectInterval;
 
     ws.onopen = () => {
+      that.setState ({ ws: ws });
       console.log("Connected to websocket");
-      this.setState({ ws: ws });
       that.timeout = 250;
       clearTimeout(connectInterval);
+      const pc = new RTCPeerConnection(PC_CONFIG);
+      that.setState({ pc: pc });
+      pc.onconnectionstatechange = () => console.log(`peer connection ${pc.connectionState}`);
+      pc.oniceconnectionstatechange = () => console.log(`ice connection state: ${pc.iceConnectionState}`);
+      pc.onsignalingstatechange = () => console.log(`signaling state: ${pc.signalingState}`);
+      pc.onicecandidate = (e) => {
+        that.setState({ pc: pc });
+        if (!e || !e.candidate) {
+          console.log("Candidate null");
+          console.log(e);
+          return;
+        }
+        const msg = JSON.stringify({ event: "candidate", data: JSON.stringify(e.candidate) });
+        ws.send(msg);
+      };
+      pc.onnegotiationneeded = async () => {
+        try {
+          makingOffer = true;
+          await pc.setLocalDescription();
+          const msg = { event: "offer", data: JSON.stringify(pc.localDescription) };
+          ws.send(JSON.stringify(msg));
+        }
+        catch (e) {
+          console.error(e);
+        }
+        finally {
+          console.log("local description set");
+          makingOffer = false;
+        }
+      };
+    };
+
+    ws.onmessage = async function (evt) {
+      if (!that.state.pc) return;
+      let msg = JSON.parse(evt.data);
+      if (!msg) {
+        return console.log("failed to parse msg");
+      }
+      if (msg.event !== "candidate") {
+        console.log(msg.event + " received");
+        console.log(msg.data);
+        const isStable = that.state.pc.signalingState === "stable" ||
+                         that.state.pc.signalingState === "have-local-offer" && srdAnswerPending;
+        const offerCollision = makingOffer || !isStable;
+        ignoreOffer = !polite && offerCollision;
+        if (ignoreOffer) return;
+        srdAnswerPending = msg.event === "answer";
+        await that.state.pc.setRemoteDescription(msg.data);
+        srdAnswerPending = false;
+        console.log("remote description set");
+        if (msg.event === "offer") {
+          await that.state.pc.setLocalDescription();
+          console.log("local description set");
+          const msg = { event: "answer", data: JSON.stringify(that.state.pc.localDescription) };
+          ws.send(JSON.stringify(msg));
+        }
+      } else {
+        const candidate = JSON.parse(msg.data);
+        console.log(candidate);
+        if (!candidate) {
+          return console.log("failed to parse candidate");
+        }
+        try {
+          await that.state.pc.addIceCandidate(candidate);
+        } catch (e) {
+          if (!ignoreOffer) throw e;
+        }
+      }
     };
 
     ws.onclose = (e) => {
@@ -61,21 +135,33 @@ class Main extends React.Component {
   };
 
   render() {
-    return <App websocket={this.state.ws}></App>;
+    return (
+      <App
+        peerconnection={this.state.pc}
+      />
+    );
   }
 }
 
 function App(props) {
-  const pc = new RTCPeerConnection(PC_CONFIG);
+  //let ignoreOffer = false;
+  //let makingOffer = false;
+  //let polite = false;
+  //let srdAnswerPending = false;
+  //const ws = props.websocket;
+
+  //const pc = new RTCPeerConnection(PC_CONFIG);
+  const peerconnection = props.pc;
   const log = (msg) => {
     document.getElementById("div").innerHTML += msg + "<br>";
   };
 
-  pc.onconnectionstatechange = () => console.log(`peer connection ${pc.connectionState}`);
-  pc.oniceconnectionstatechange = () => console.log(`ice connection state: ${pc.iceConnectionState}`);
-  pc.onsignalingstatechange = () => console.log(`signaling state: ${pc.signalingState}`);
+  //pc.onconnectionstatechange = () => console.log(`peer connection ${pc.connectionState}`);
+  //pc.oniceconnectionstatechange = () => console.log(`ice connection state: ${pc.iceConnectionState}`);
+  //pc.onsignalingstatechange = () => console.log(`signaling state: ${pc.signalingState}`);
 
-  pc.ontrack = (event) => {
+  if (peerconnection) {
+  peerconnection.ontrack = (event) => {
     if (event.track.kind === "audio") {
       return;
     }
@@ -84,6 +170,7 @@ function App(props) {
     el.autoplay = true;
     el.controls = true;
   };
+  }
 
   // pc.oniceconnectionstatechange = e => log(pc.iceConnectionState)
   // pc.onicecandidate = event => {
@@ -93,20 +180,22 @@ function App(props) {
   //     }
   // }
 
+  if (peerconnection) {
   // Offer to receive 1 audio, and 1 video tracks
-  pc.addTransceiver("audio", { direction: "recvonly" });
+  peerconnection.current.addTransceiver("audio", { direction: "recvonly" });
   // pc.addTransceiver('video', { 'direction': 'recvonly' })
-  pc.addTransceiver("video", { direction: "recvonly" });
+  peerconnection.current.addTransceiver("video", { direction: "recvonly" });
+  }
 
-  const ws = props.websocket;
+  /*
   pc.onicecandidate = (e) => {
     if (!e || !e.candidate) {
       console.log("Candidate null");
       console.log(e);
       return;
     }
-
-    ws.send(JSON.stringify({ event: "candidate", data: JSON.stringify(e.candidate) }));
+    const msg = JSON.stringify({ event: "candidate", data: JSON.stringify(e.candidate) });
+    ws.send(msg);
   };
 
   pc.onnegotiationneeded = async () => {
@@ -120,7 +209,7 @@ function App(props) {
       console.error(e);
     }
     finally {
-      console.log('local description set');
+      console.log("local description set");
       makingOffer = false;
     }
   };
@@ -163,6 +252,7 @@ function App(props) {
       }
     };
   }
+  */
 
   // let sd = document.getElementById('remoteSessionDescription').value
   // if (sd === '') {
